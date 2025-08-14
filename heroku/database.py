@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class NoAssetsChannel(Exception):
-    """Raised when trying to read/store asset with no asset channel present"""
+    pass
 
 
 class Database(dict):
@@ -57,10 +57,7 @@ class Database(dict):
 
     def _redis_save_sync(self):
         with self._redis.pipeline() as pipe:
-            pipe.set(
-                str(self._client.tg_id),
-                json.dumps(self, ensure_ascii=True),
-            )
+            pipe.set(str(self._client.tg_id), json.dumps(self, ensure_ascii=True))
             pipe.execute()
 
     async def remote_force_save(self) -> bool:
@@ -80,27 +77,33 @@ class Database(dict):
         return True
 
     async def redis_init(self) -> bool:
-        """Init Redis using Railway credentials (with correct handling of username/password/SSL)"""
         redis_url = (
             os.environ.get("REDIS_URL")
             or os.environ.get("REDIS_PUBLIC_URL")
             or main.get_config_key("redis_uri")
         )
         if not redis_url:
+            logger.error("No Redis URL found in environment or config")
             return False
 
         try:
             parsed = urlparse(redis_url)
+
+            # Railway обычно даёт username = default
+            username = parsed.username or "default"
+            password = parsed.password
+
             self._redis = redis.Redis(
                 host=parsed.hostname,
-                port=parsed.port,
-                username=parsed.username,
-                password=parsed.password,
+                port=parsed.port or 6379,
+                username=username,
+                password=password,
                 ssl=(parsed.scheme == "rediss"),
-                ssl_cert_reqs=None if parsed.scheme == "rediss" else None
+                decode_responses=False
             )
+
             self._redis.ping()
-            logger.debug("Connected to Redis successfully")
+            logger.info("Connected to Redis successfully")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to Redis: {e}")
@@ -155,17 +158,14 @@ class Database(dict):
     def process_db_autofix(self, db: dict) -> bool:
         if not utils.is_serializable(db):
             return False
-
         for key, value in db.copy().items():
             if not isinstance(key, (str, int)):
                 logger.warning("DbAutoFix: Dropped key %s, because type is %s", key, type(key))
                 continue
-
             if not isinstance(value, dict):
                 del db[key]
                 logger.warning("DbAutoFix: Dropped key %s, because type is %s", key, type(value))
                 continue
-
             for subkey in list(value):
                 if not isinstance(subkey, (str, int)):
                     del db[key][subkey]
@@ -183,10 +183,8 @@ class Database(dict):
                     rev = self._revisions.pop()
             except IndexError:
                 raise RuntimeError("Can't find revision to restore broken database from; db broken.")
-
             self.clear()
             self.update(**rev)
-
             raise RuntimeError("Rewriting database to the last known good revision.")
 
         if time.time() > self._next_revision_call:
@@ -212,7 +210,6 @@ class Database(dict):
     async def store_asset(self, message: Message) -> int:
         if not self._assets:
             raise NoAssetsChannel("Tried to save asset to non-existing asset channel")
-
         if isinstance(message, Message):
             return (await self._client.send_message(self._assets, message)).id
         return (await self._client.send_message(self._assets, file=message, force_document=True)).id
@@ -220,7 +217,6 @@ class Database(dict):
     async def fetch_asset(self, asset_id: int) -> typing.Optional[Message]:
         if not self._assets:
             raise NoAssetsChannel("Tried to fetch asset from non-existing asset channel")
-
         asset = await self._client.get_messages(self._assets, ids=[asset_id])
         return asset[0] if asset else None
 
@@ -237,38 +233,23 @@ class Database(dict):
             raise RuntimeError(f"Non-serializable key: {key}")
         if not utils.is_serializable(value):
             raise RuntimeError(f"Non-serializable value: {value}")
-
         super().setdefault(owner, {})[key] = value
         return self.save()
 
-    def pointer(
-        self,
-        owner: str,
-        key: str,
-        default: typing.Optional[JSONSerializable] = None,
-        item_type: typing.Optional[typing.Any] = None,
-    ) -> typing.Union[JSONSerializable, PointerList, PointerDict]:
+    def pointer(self, owner: str, key: str, default: typing.Optional[JSONSerializable] = None, item_type: typing.Optional[typing.Any] = None) -> typing.Union[JSONSerializable, PointerList, PointerDict]:
         value = self.get(owner, key, default)
         mapping = {
             list: PointerList,
             dict: PointerDict,
             collections.abc.Hashable: lambda v: v,
         }
-
-        pointer_constructor = next(
-            (ptr for t, ptr in mapping.items() if isinstance(value, t)),
-            None,
-        )
-
+        pointer_constructor = next((ptr for t, ptr in mapping.items() if isinstance(value, t)), None)
         if (current_value := self.get(owner, key, None)) and type(current_value) is not type(default):
             raise ValueError("Pointer type mismatch in database")
-
         if pointer_constructor is None:
             raise ValueError(f"Pointer for type {type(value)} not implemented")
-
         if item_type is not None and isinstance(value, list):
             return NamedTupleMiddlewareList(pointer_constructor(self, owner, key, default), item_type)
         if item_type is not None and isinstance(value, dict):
             return NamedTupleMiddlewareDict(pointer_constructor(self, owner, key, default), item_type)
-
         return pointer_constructor(self, owner, key, default)
