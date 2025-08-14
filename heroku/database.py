@@ -80,39 +80,34 @@ class Database(dict):
         return True
 
     async def redis_init(self) -> bool:
-        REDIS_URI = os.environ.get("REDIS_URL") or main.get_config_key("redis_uri")
-        if not REDIS_URI:
+        """Init Redis using Railway credentials (with correct handling of username/password/SSL)"""
+        redis_url = (
+            os.environ.get("REDIS_URL")
+            or os.environ.get("REDIS_PUBLIC_URL")
+            or main.get_config_key("redis_uri")
+        )
+        if not redis_url:
             return False
-
-        url = urlparse(REDIS_URI)
-
-        # Убираем "default:" если это просто Railway placeholder
-        if url.username == "default":
-            REDIS_URI = REDIS_URI.replace("default:", "", 1)
-
-        if url.scheme == "rediss":
-            self._redis = redis.Redis.from_url(
-                REDIS_URI,
-                ssl=True,
-                ssl_cert_reqs=None
-            )
-        else:
-            self._redis = redis.Redis.from_url(REDIS_URI)
 
         try:
+            parsed = urlparse(redis_url)
+            self._redis = redis.Redis(
+                host=parsed.hostname,
+                port=parsed.port,
+                username=parsed.username,
+                password=parsed.password,
+                ssl=(parsed.scheme == "rediss"),
+                ssl_cert_reqs=None if parsed.scheme == "rediss" else None
+            )
             self._redis.ping()
-            logger.debug("Successfully connected to Redis")
-        except redis.exceptions.AuthenticationError as e:
-            logger.error(f"Redis auth failed: {e}")
+            logger.debug("Connected to Redis successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {e}")
             return False
-        except redis.exceptions.ConnectionError as e:
-            logger.error(f"Redis connection failed: {e}")
-            return False
-
-        return True
 
     async def init(self):
-        if os.environ.get("REDIS_URL") or main.get_config_key("redis_uri"):
+        if os.environ.get("REDIS_URL") or os.environ.get("REDIS_PUBLIC_URL") or main.get_config_key("redis_uri"):
             await self.redis_init()
 
         self._db_file = main.BASE_PATH / f"config-{self._client.tg_id}.json"
@@ -174,7 +169,10 @@ class Database(dict):
             for subkey in list(value):
                 if not isinstance(subkey, (str, int)):
                     del db[key][subkey]
-                    logger.warning("DbAutoFix: Dropped subkey %s of db key %s because type is %s", subkey, key, type(subkey))
+                    logger.warning(
+                        "DbAutoFix: Dropped subkey %s of db key %s because type is %s",
+                        subkey, key, type(subkey)
+                    )
         return True
 
     def save(self) -> bool:
@@ -214,6 +212,7 @@ class Database(dict):
     async def store_asset(self, message: Message) -> int:
         if not self._assets:
             raise NoAssetsChannel("Tried to save asset to non-existing asset channel")
+
         if isinstance(message, Message):
             return (await self._client.send_message(self._assets, message)).id
         return (await self._client.send_message(self._assets, file=message, force_document=True)).id
@@ -221,11 +220,15 @@ class Database(dict):
     async def fetch_asset(self, asset_id: int) -> typing.Optional[Message]:
         if not self._assets:
             raise NoAssetsChannel("Tried to fetch asset from non-existing asset channel")
+
         asset = await self._client.get_messages(self._assets, ids=[asset_id])
         return asset[0] if asset else None
 
     def get(self, owner: str, key: str, default: typing.Optional[JSONSerializable] = None) -> JSONSerializable:
-        return self.get(owner, key, default)
+        try:
+            return self[owner][key]
+        except KeyError:
+            return default
 
     def set(self, owner: str, key: str, value: JSONSerializable) -> bool:
         if not utils.is_serializable(owner):
